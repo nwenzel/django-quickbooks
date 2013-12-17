@@ -2,8 +2,10 @@ import urllib
 import re
 import uuid
 import datetime
+import sys
 from lxml import etree
 import requests
+
 from oauth_hook import OAuthHook
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -23,6 +25,9 @@ QBD_NSMAP = {None: QB_NAMESPACE, 'xsi': XML_SCHEMA_INSTANCE, 'xsd': XML_SCHEMA}
 Q = "{%s}" % QB_NAMESPACE
 XSI = "{%s}" % XML_SCHEMA_INSTANCE
 
+from .exceptions import TagNotFound
+from .utils import gettext
+from .utils import getel
 
 def camel2hyphen(name):
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1-\2', name)
@@ -42,6 +47,8 @@ def obj2xml(parent, params):
             elt = etree.SubElement(parent, Q + k)
             if k == 'Id':
                 elt.set('idDomain', 'NG')
+            elif k in ('CustomerId', 'ItemId'):
+                elt.set('idDomain', 'QB')
             if isinstance(v, bool):
                 val = {True: 'true', False: 'false'}[v]
             elif isinstance(v, datetime.date) or isinstance(v, datetime.datetime):
@@ -52,6 +59,7 @@ def obj2xml(parent, params):
     return parent
 
 def xml2obj(elt):
+    return elt
     if len(elt) == 0:
         return elt.text
     else:
@@ -90,13 +98,18 @@ class DuplicateItemError(ApiError):
 
 def api_error(response):
     if isinstance(response, requests.Response):
-        err = xml2obj(etree.fromstring(response.content))
+        err = response.content
     else:
         err = response
-    error_code = err.get('ErrorCode', 'BAD_REQUEST')
-    message = err.get('Message', err.get('ErrorDesc', ''))
-    cause = err.get('Cause', '')
-    db_error_code = err.get('DBErrorCode', '')
+    error_code = gettext(err, 'ErrorCode', default='BAD_REQUEST')
+    #error_code = err.get('ErrorCode', 'BAD_REQUEST')
+    message = gettext(err, 'Message', default=gettext(err, 'ErrorDesc',
+        default=''))
+    #message = err.get('Message', err.get('ErrorDesc', ''))
+    cause = gettext(err, 'Cause', default='')
+    #cause = err.get('Cause', '')
+    db_error_code = gettext(err, 'DBErrorCode', default='')
+    #db_error_code = err.get('DBErrorCode', '')
     err_msg = "%s: %s %s" % (error_code, cause, message)
 
     if str(error_code) in ['3200', '270'] or 'oauth_problem' in message:
@@ -142,9 +155,11 @@ class QuickbooksApi(object):
             return base + 's'
         return base
 
-    def _create_wrapped_qbd_root(self, action, object_name=None, request_and_realm_ids=True):
-        wrapper = etree.Element(action, nsmap=self.nsmap)
-        wrapper.set(XSI + 'schemaLocation', 'http://www.intuit.com/sb/cdm/V2./RestDataFilter.xsd ')
+    def _create_wrapped_qbd_root(self, action, object_name=None,
+    request_and_realm_ids=True, nsmap=None):
+        wrapper = etree.Element(action, nsmap=(nsmap or self.nsmap))
+        if not nsmap:
+            wrapper.set(XSI + 'schemaLocation', 'http://www.intuit.com/sb/cdm/V2./RestDataFilter.xsd ')
         if request_and_realm_ids:
             wrapper.set('RequestId', uuid.uuid4().hex)
             wrapper.set('FullResponse', 'true')
@@ -160,86 +175,156 @@ class QuickbooksApi(object):
         return wrapper, root
 
     def _get(self, url, headers=None):
-        return self.session.get(url, headers=headers, verify=False)
+        r = self.session.get(url, headers=headers, verify=False)
+        return r
 
     def _post(self, url, body='', headers=None):
         return self.session.post(url, data=body, headers=headers, verify=False)
 
-    def _appcenter_request(self, url):
+    def _appcenter_request(self, url, retries=3):
         full_url = APPCENTER_URL_BASE + url
-        return self._get(full_url).content
 
-    def _qb_request(self, object_name, method='GET', object_id=None, xml=None, body_dict=None, **kwargs):
+        for retry_i in range(retries+1):
+            content = self._get(full_url).content
+
+            try:
+                el = etree.fromstring(content)
+            except etree.XMLSyntaxError:
+                return content
+
+            try:
+                ns = el.nsmap[None]
+                err_code = gettext(el, 'ErrorCode', ns=ns)
+                err_msg = gettext(el, 'ErrorMessage', ns=ns)
+                if err_code == '0':
+                    return content
+                if err_code == '22':
+                    # The API returns this sometimes even when the user is
+                    # authenticated.
+                    if retry_i < retries:
+                        continue
+                raise AuthenticationFailure(err_msg)
+            except TagNotFound:
+                break
+
+        return content
+
+    def _qb_request(self, object_name, method='GET', object_id=None, xml=None,
+    body_dict=None, retries=3, **kwargs):
         url = "%s%s/%s/%s" % (self.url_base, object_name, DATA_SERVICES_VERSION, self.realm_id)
         if object_id:
             url += '/%s' % object_id
         if kwargs:
             url = "%s?%s" % (url, urllib.urlencode(kwargs))
-        if method == 'GET':
-            response = self._get(url)
-        else:
-            if xml is not None:
-                body = etree.tostring(xml, xml_declaration=True, encoding='utf-8', pretty_print=True)
-                response = self._post(url, body, headers={'Content-Type': self.xml_content_type})
-            elif body_dict is not None:
-                response = self._post(url, body_dict, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        last_err = None
+        for retry_i in range(retries + 1):
+            last_err = None
+            if method == 'GET':
+                response = self._get(url)
             else:
-                response = self._post(url, headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        try:
-            if response.status_code == 500 and 'errorCode=006003' in response.content:
-                # QB appears to randomly throw 500 errors once and a while. Awesome.
-                raise TryLaterError()
-            if response.status_code == 401:
-                # Token has expired. Delete all tokens for this user
-                raise AuthenticationFailure()
-            if response.status_code != 200:
+                if xml is not None:
+                    body = etree.tostring(xml, xml_declaration=True, encoding='utf-8', pretty_print=True)
+                    """
+                    print("\n\n\n\n")
+                    print("***** Request *****")
+                    print(body)
+                    """
+                    response = self._post(url, body, headers={'Content-Type': self.xml_content_type})
+                    """
+                    print("\n\n\n\n***** Response *****")
+                    print(etree.tostring(etree.fromstring(response.content),
+                        pretty_print=True))
+                    print("\n\n\n\n")
+                    """
+
+                elif body_dict is not None:
+                    response = self._post(url, body_dict, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+                else:
+                    response = self._post(url, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+            try:
+                if response.status_code == 500 and 'errorCode=006003' in response.content:
+                    # QB appears to randomly throw 500 errors once and a while. Awesome.
+                    last_err = TryLaterError()
+                if response.status_code == 401:
+                    # Token has expired. Delete all tokens for this user
+                    raise AuthenticationFailure()
+                if response.status_code != 200:
+                    try:
+                        api_error(response)
+                    except etree.XMLSyntaxError:
+                        raise CommunicationError(response.content)
+                result = etree.fromstring(response.content)
                 try:
-                    api_error(response)
-                except etree.XMLSyntaxError:
-                    raise CommunicationError(response.content)
-            result = xml2obj(etree.fromstring(response.content))
-            if 'Error' in result:
-                api_error(result['Error'])
-        except AuthenticationFailure:
-            #self.token.user.quickbookstoken_set.all().delete()
-            raise
+                    err = getel(result, 'Error')
+                except TagNotFound:
+                    err = None
+                if err is not None:
+                    api_error(err)
+            except AuthenticationFailure as err:
+                last_err = err
+            if last_err is None:
+                break
+        if last_err:
+            raise last_err.__class__ (str(last_err)), None, sys.exc_info()[2]
         return result
 
-    def app_menu(self):
-        return self._appcenter_request('Account/AppMenu')
+    def app_menu(self, retries=3):
+        return self._appcenter_request('Account/AppMenu', retries=retries)
 
     def disconnect(self):
         return self._appcenter_request('Connection/Disconnect')
 
-
-    def create(self, object_name, params):
+    def create(self, object_name, elements, retries=3):
         url_name = self._get_url_name(object_name, 'create')
         if self.data_source == 'QBO':
             root = etree.Element(object_name, nsmap=self.nsmap)
-            obj2xml(root, params)
+            data_root = root
         else:
             root, data_root = self._create_wrapped_qbd_root('Add', object_name)
-            obj2xml(data_root, params)
+        for el in elements:
+            data_root.append(el)
 
-        result = self._qb_request(url_name, 'POST', xml=root)
+        result = self._qb_request(url_name, 'POST', xml=root, retries=retries)
 
         if self.data_source == 'QBD':
-            container = result['Success']
-            for k, v in container.items():
-                if k == object_name:
-                    return v
+            container = getel(result, 'Success')
+            res = getel(container, object_name)
+            if res is not None:
+                return res
             return container
         else:
             return result
 
-    def read(self, object_name):
+    def filter(self, object_name, elements, retries=3):
+        url_name = self._get_url_name(object_name, 'filter')
+        if self.data_source == 'QBO':
+            raise NotImplementedError(
+                'QB Online filtering is not supported at this time')
+        else:
+            root, data_root = self._create_wrapped_qbd_root(
+                '%sQuery' % object_name, None,
+                request_and_realm_ids=False,
+                nsmap={None:self.nsmap[None]})
+            [root.append(el) for el in elements]
+            return self._qb_request(url_name, 'POST', xml=root)
+
+
+    def read(self, object_name, retries=3):
+        """ Get object data from Quickbooks.
+
+        :type  object_name: string
+        :param object_name: Type of object to return (e.g., "Customer")
+        """
+
         url_name = self._get_url_name(object_name, 'read')
         if self.data_source == 'QBO':
             results = []
             count = 100
             page = 1
             while count == 100:
-                these_results = self._qb_request(url_name, 'POST', body_dict={'PageNum': str(page), 'ResultsPerPage': '100'})
+                these_results = self._qb_request(
+                    url_name, 'POST', body_dict={'PageNum': str(page),
+                    'ResultsPerPage': '100'}, retries=retries)
                 count = int(these_results['Count'])
                 if count == 1:
                     results += [these_results['CdmCollections'][object_name]]
@@ -248,44 +333,45 @@ class QuickbooksApi(object):
                 page += 1
             return results
         else:
-            return self._qb_request(url_name, 'GET')
+            return self._qb_request(url_name, 'GET', retries=retries)
 
-    def get(self, object_name, object_id):
+    def get(self, object_name, object_id, id_domain='NG'):
         url_name = self._get_url_name(object_name, 'get')
         if self.data_source == 'QBO':
             return self._qb_request(url_name, 'GET', object_id=object_id)
         else:
-            return self._qb_request(url_name, 'GET', object_id=object_id, idDomain='NG')
+            return self._qb_request(url_name, 'GET', object_id=object_id,
+                idDomain=id_domain)
 
-    def update(self, object_name, params):
-        object_id = params['Id']
+    def update(self, object_name, params, retries=3):
         url_name = self._get_url_name(object_name, 'update')
         if self.data_source == 'QBO':
             root = etree.Element(object_name, nsmap=self.nsmap)
-            obj2xml(root, params)
-            return self._qb_request(url_name, 'POST', object_id=object_id, xml=root)
+            root.append(params)
+            return self._qb_request(url_name, 'POST', object_id=object_id,
+                xml=root, retries=retries)
         else:
             root, data_root = self._create_wrapped_qbd_root('Mod', object_name)
-            obj2xml(data_root, params)
-            result = self._qb_request(url_name, 'POST', xml=root)
+            for param in params:
+                data_root.append(param)
+            result = self._qb_request(url_name, 'POST', xml=root,
+                retries=retries)
 
-            container = result['Success']
-            for k, v in container.items():
-                if k == object_name:
-                    return v
-            return container
+            container = getel(result, 'Success')
+            return getel(container, object_name)
 
-    def delete(self, object_name, params):
+    def delete(self, object_name, params, retries=3):
         object_id = params['Id']
         url_name = self._get_url_name(object_name, 'delete')
         if self.data_source == 'QBO':
             root = etree.Element(object_name, nsmap=self.nsmap)
             obj2xml(root, params)
-            return self._qb_request(url_name, 'POST', object_id=object_id, xml=root, methodx='delete')
+            return self._qb_request(url_name, 'POST', object_id=object_id,
+                xml=root, methodx='delete', retries=retries)
         else:
             root, data_root = self._create_wrapped_qbd_root('Del', object_name)
             obj2xml(data_root, params)
-            return self._qb_request(url_name, 'POST', xml=root)
+            return self._qb_request(url_name, 'POST', xml=root, retries=retries)
 
     def search(self, object_name, params):
         url_name = self._get_url_name(object_name, 'read')
